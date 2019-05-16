@@ -3,6 +3,7 @@
 require 'rubygems'
 require 'bundler/setup'
 require 'ckb'
+require 'parallel'
 
 def get_privkey(name)
   File.read(name).strip
@@ -66,91 +67,98 @@ def explode_secp_cell(api, key, cell, factor)
   api.send_transaction tx.sign(miner_key, tx_hash)
 end
 
-def biubiu_secp_cells(api, key1, key2, from, to)
+def biubiu_secp_cells(apis, key1, key2, from, to)
+  api = apis[0]
+  num_of_server = apis.size
   addr1 = key1.address.generate
   addr2 = key2.address.generate
   cells = api.get_cells_by_lock_hash(get_secp_lock(api, key1).to_hash, from, to).shuffle
 
-  txs = []
   expected = cells.size / 2
-  while !cells.empty?
-    cell1, cell2 = cells.sample(2)
-    cells.delete(cell1)
-    cells.delete(cell2)
-    next if cell1.nil? || cell2.nil?
-
-    inputs = [
-      CKB::Types::Input.new(
-        previous_output: cell1.out_point,
-        args: [],
-        since: "0"
-      ),
-      CKB::Types::Input.new(
-        previous_output: cell2.out_point,
-        args: [],
-        since: "0"
-      )
-    ]
-
-    cap = cell1.capacity.to_i + cell2.capacity.to_i
-    fee = 50000
-    r = [[rand, 0.35].max, 0.65].min
-    cap1 = (cap * r).floor
-    cap2 = cap - cap1 - fee
-    outputs = [
-      # spending to key2
-      CKB::Types::Output.new(
-        capacity: cap1,
-        lock: CKB::Types::Script.generate_lock(
-          key2.address.parse(addr2),
-          api.system_script_cell_hash
+  txs = Parallel.map_with_index(cells.shuffle.each_slice(2)) do |(cell1, cell2), i|
+    if cell1 && cell2
+      inputs = [
+        CKB::Types::Input.new(
+          previous_output: cell1.out_point,
+          args: [],
+          since: "0"
+        ),
+        CKB::Types::Input.new(
+          previous_output: cell2.out_point,
+          args: [],
+          since: "0"
         )
-      ),
-      # charge back to key1
-      CKB::Types::Output.new(
-        capacity: cap2,
-        lock: CKB::Types::Script.generate_lock(
-          key1.address.parse(addr1),
-          api.system_script_cell_hash
+      ]
+
+      cap = cell1.capacity.to_i + cell2.capacity.to_i
+      fee = 50000
+      r = [[rand, 0.35].max, 0.65].min
+      cap1 = (cap * r).floor
+      cap2 = cap - cap1 - fee
+      outputs = [
+        # spending to key2
+        CKB::Types::Output.new(
+          capacity: cap1,
+          lock: CKB::Types::Script.generate_lock(
+            key2.address.parse(addr2),
+            api.system_script_cell_hash
+          )
+        ),
+        # charge back to key1
+        CKB::Types::Output.new(
+          capacity: cap2,
+          lock: CKB::Types::Script.generate_lock(
+            key1.address.parse(addr1),
+            api.system_script_cell_hash
+          )
         )
+      ]
+
+      _tx = CKB::Types::Transaction.new(
+        version: "0",
+        deps: [api.system_script_out_point],
+        inputs: inputs,
+        outputs: outputs
       )
-    ]
+      begin
+        _tx_hash = api.compute_transaction_hash(_tx)
+        puts "#{i+1}/#{expected} transactions prepared"
+        _tx.sign(key1, _tx_hash)
+      rescue
+        p $!
+        nil
+      end
+    end
+  end.compact
 
-    _tx = CKB::Types::Transaction.new(
-      version: "0",
-      deps: [api.system_script_out_point],
-      inputs: inputs,
-      outputs: outputs
-    )
-    _tx_hash = api.compute_transaction_hash(_tx)
-    txs.push _tx.sign(key1, _tx_hash)
-    puts "#{txs.size}/#{expected} transactions prepared"
-  end
-
-  txids = []
   puts "sending #{txs.size} transactions from #{addr1} to #{addr2} ..."
   t1 = Time.now
-  txs.each_with_index do |tx, i|
+  txids = Parallel.map_with_index(txs) do |tx, i|
     begin
       tt1 = Time.now.to_f
-      txids << api.send_transaction(tx)
+      txid = apis[i % num_of_server].send_transaction(tx)
       tt2 = Time.now.to_f
       puts "#{i+1}/#{txs.size} sent in #{tt2-tt1}s, begin: #{tt1}, end: #{tt2}"
+      txid
     rescue
       p $!
+      nil
     end
-  end
+  end.compact
   t2 = Time.now
 
   t3 = Time.now
   puts "all transactions sent in #{t2 - t1} seconds! confirming..."
   txids.each_with_index do |id, i|
     loop do
-      _tx = api.get_transaction(id)
-      break if _tx.tx_status.status == 'committed'
-      sleep 1
+      begin
+        _tx = api.get_transaction(id)
+        break if _tx && _tx.tx_status.status == 'committed'
+      rescue
+        p $!
+      end
+      sleep 0.05
     end
-    t3 = Time.now if i == 0
     puts "#{i+1}/#{txids.size} transactions committed"
   end
   t4 = Time.now
@@ -169,13 +177,11 @@ def explode_secp(api, key, from, to)
   cells = get_cellbases(api, from, to)
   factor = cells.first.capacity.to_i / 10**8 / 125
 
-  90.times do
+  cells.shuffle.each do |cell|
     tip = api.get_tip_header
     puts "\nBlock##{tip.number} #{tip.hash} #{Time.at(tip.timestamp.to_i/1000.0)}"
 
     begin
-      cell = cells.sample
-      cells.delete(cell)
       txs << explode_secp_cell(api, key, cell, factor)
     rescue
       puts $!.backtrace
@@ -187,13 +193,13 @@ def explode_secp(api, key, from, to)
   p txs
 end
 
-def biubiu_secp(api, key1, key2, from, to)
+def biubiu_secp(apis, key1, key2, from, to)
   txs = []
-  tip = api.get_tip_header
+  tip = apis[0].get_tip_header
   puts "\nBlock##{tip.number} #{tip.hash} #{Time.at(tip.timestamp.to_i/1000.0)}"
 
   begin
-    txs = biubiu_secp_cells(api, key1, key2, from, to)
+    txs = biubiu_secp_cells(apis, key1, key2, from, to)
   rescue
     puts $!.backtrace
     p $!
@@ -201,13 +207,17 @@ def biubiu_secp(api, key1, key2, from, to)
   p txs
 end
 
-api = CKB::API.new
-#wallet = CKB::Wallet.new(api, key)
+apis = File.readlines('servers').map do |line|
+  host = line.strip
+  if host != ""
+    CKB::API.new(host: host)
+  end
+end.compact
 
 if ARGV[0] == 'explode_secp'
-  explode_secp(api, key1, ARGV[1], ARGV[2])
+  explode_secp(apis[0], key1, ARGV[1], ARGV[2])
 elsif ARGV[0] == 'biubiu_secp'
-  biubiu_secp(api, key1, key2, ARGV[1], ARGV[2])
+  biubiu_secp(apis, key1, key2, ARGV[1], ARGV[2])
 elsif ARGV[0] == 'generate_key'
   p CKB::Key.random_private_key
 end
